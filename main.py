@@ -1,5 +1,5 @@
 """
-Bot de Discord con sistema antinuke.
+Bot de  Discord con sistema antinuke.
 Arranque: python main.py  (usa la variable de entorno DISCORD_TOKEN)
 
 Todos los comandos son "híbridos": funcionan tanto como comando de barra
