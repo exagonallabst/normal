@@ -1,511 +1,259 @@
 """
-/backup now|list|restore|auto  ->  backup automático (y manual) de la
-estructura de categorías y canales del servidor, para poder restaurarla
-después de un nuke.
+Snapshots del estado actual (categorías + canales, EN ORDEN) de un
+servidor, para poder restaurarlo después de un nuke.
 
-Funciona como slash (/backup now) y con prefijo (!backup now): es el
-mismo comando híbrido en los dos casos, igual que el resto del bot.
+Diseño clave: el orden se guarda de forma IMPLÍCITA en el orden de las
+listas del JSON — el primer elemento de "categories" es la primera
+categoría de arriba hacia abajo, el primer canal de una categoría es el
+de más arriba dentro de ella, etc. No se guarda el "position" crudo de
+Discord porque no sirve de nada reutilizarlo tal cual: tras un nuke los
+IDs y posiciones se renumeran todos, así que lo único que importa es
+reproducir el MISMO ORDEN relativo, no el mismo número. Ver
+cogs/backups.py para cómo se usa esto al restaurar.
 
-DISEÑO IMPORTANTE (léelo antes de tocar el scheduler):
-a propósito, un backup automático NUNCA se dispara en reacción directa a
-un canal/categoría borrado. Si lo hiciera, un nuke en curso (que borra
-todo en segundos) pisaría el último backup bueno con el servidor ya
-vacío, justo cuando más se necesita — el peor momento posible para que
-el "seguro" se rompa. En cambio hay 3 disparadores, todos "seguros" en
-ese sentido:
+CUÁNDO se toma un snapshot automático es decisión de cogs/backups.py, no
+de este módulo — acá solo vive la lógica de "cómo armar un snapshot" y
+"dónde guardarlo/leerlo". Pero para que quede documentado en un solo
+lugar: a propósito NUNCA se dispara un backup en reacción directa a un
+canal/categoría borrado, porque un nuke en curso pisaría el último
+backup bueno con el servidor ya vacío, justo cuando más se necesita.
 
-  1. Al conectar el bot (primer on_ready).
-  2. Periódico, cada intervalo configurable con /backup auto (por
-     defecto 30 minutos).
-  3. Manual, con /backup now.
-
-Ninguno de los tres reacciona a un borrado, así que el snapshot más
-reciente casi siempre representa al servidor ANTES de cualquier ataque.
-Como contrapartida, si alguien borra un canal a propósito (limpieza
-normal), el backup no se "entera" hasta el próximo tick periódico — es
-un trade-off intencional a favor de nunca arruinar el respaldo bueno.
-
-La restauración (/backup restore) NUNCA borra nada que no esté en el
-backup — solo crea lo que falta y actualiza (nombre/posición/permisos)
-lo que ya existe con el mismo id o el mismo nombre+tipo. Si el atacante
-dejó canales de spam, esos no se tocan; hay que borrarlos a mano (o ya
-estarán baneados por el antinuke, que corre en paralelo a esto).
+Archivos: un JSON por snapshot en
+<DATA_DIR>/backups/<guild_id>/<timestamp_unix>.json. En vez de pisar
+siempre el mismo archivo se guardan varios, y se podan los más viejos
+más allá de MAX_BACKUPS_PER_GUILD — así, si un nuke justo coincidiera
+con un snapshot automático, todavía queda una historia reciente de
+snapshots buenos anteriores para elegir de dónde restaurar.
 """
 from __future__ import annotations
 
-import asyncio
-import logging
+import json
 import time
-from datetime import datetime, timezone
+from pathlib import Path
+from threading import Lock
+from typing import Any
 
 import discord
-from discord import app_commands
-from discord.ext import commands, tasks
 
-from utils import backups, database
-from utils.embeds import COLOR_INFO, error_embed, info_embed, success_embed
-from utils.permissions import AntiNukeCogBase, admin_only
+from utils.database import DATA_DIR
 
-log = logging.getLogger("antinuke")
+BACKUPS_DIR = DATA_DIR / "backups"
+MAX_BACKUPS_PER_GUILD = 10
+SCHEMA_VERSION = 1
 
-DEFAULT_INTERVAL_MINUTES = 30
-SCHEDULER_TICK_MINUTES = 5
-MIN_NONZERO_INTERVAL = 5
-SLEEP_BETWEEN_CALLS = 0.4
-RESTORE_REASON = "[AntiNuke] Restauración de backup"
+_lock = Lock()
 
-
-def _relative_label(iso_string: str | None) -> str:
-    """Texto plano ('hace 12 min') para usar en autocomplete, donde
-    Discord muestra el string tal cual (no interpreta markdown)."""
-    if not iso_string:
-        return "?"
-    try:
-        dt = datetime.fromisoformat(iso_string)
-    except ValueError:
-        return "?"
-    secs = int((datetime.now(timezone.utc) - dt).total_seconds())
-    if secs < 60:
-        return "hace segundos"
-    if secs < 3600:
-        return f"hace {secs // 60} min"
-    if secs < 86400:
-        return f"hace {secs // 3600} h"
-    return f"hace {secs // 86400} d"
+# Tipos de canal que forman parte de la estructura "canales y categorías"
+# que cubre este backup. Los hilos (threads) quedan afuera a propósito:
+# son temporales, no son parte fija de la jerarquía de categorías, y
+# discord.py ni siquiera los expone en guild.channels (viven aparte en
+# guild.threads), así que no hace falta filtrarlos, pero se documenta
+# igual para que quede claro que es intencional si alguien pregunta "¿y
+# los hilos?".
+SUPPORTED_CHANNEL_TYPES = {"text", "news", "voice", "stage_voice", "forum", "media"}
 
 
-def _discord_timestamp(iso_string: str | None) -> str:
-    """<t:...:R> para usarlo en embeds, donde Discord SÍ lo renderiza
-    como 'hace 12 minutos' (traducido al idioma de quien lo ve)."""
-    if not iso_string:
-        return "?"
-    try:
-        dt = datetime.fromisoformat(iso_string)
-    except ValueError:
-        return "?"
-    return f"<t:{int(dt.timestamp())}:R>"
+def _guild_dir(guild_id: int) -> Path:
+    d = BACKUPS_DIR / str(guild_id)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
-class RestoreReport:
-    def __init__(self) -> None:
-        self.created = 0
-        self.updated = 0
-        self.errors: list[str] = []
+def _overwrites_to_data(overwrites: dict) -> list[dict[str, Any]]:
+    """Serializa los permission overwrites de un canal/categoría. Se
+    guarda el id Y el nombre del rol/miembro: el id sirve si todavía
+    existe tal cual, el nombre es el fallback si hubo que recrearlo
+    (o si el id ya no existe) al restaurar."""
+    data = []
+    for target, ow in overwrites.items():
+        allow, deny = ow.pair()
+        kind = "role" if isinstance(target, discord.Role) else "member"
+        data.append({
+            "type": kind,
+            "id": target.id,
+            "name": str(target),
+            "allow": allow.value,
+            "deny": deny.value,
+        })
+    return data
 
 
-class BackupCommands(AntiNukeCogBase):
-    def __init__(self, bot: commands.Bot) -> None:
-        super().__init__(bot)
-        self._restore_locks: dict[int, asyncio.Lock] = {}
+def _channel_to_data(channel: discord.abc.GuildChannel) -> dict[str, Any] | None:
+    ch_type = channel.type.name
+    if ch_type not in SUPPORTED_CHANNEL_TYPES:
+        return None
 
-    async def cog_unload(self) -> None:
-        self.auto_backup_loop.cancel()
+    data: dict[str, Any] = {
+        "id": channel.id,
+        "name": channel.name,
+        "type": ch_type,
+        "overwrites": _overwrites_to_data(channel.overwrites),
+    }
 
-    def _lock_for(self, guild_id: int) -> asyncio.Lock:
-        return self._restore_locks.setdefault(guild_id, asyncio.Lock())
+    if ch_type in ("text", "news"):
+        data["topic"] = channel.topic or ""
+        data["nsfw"] = channel.nsfw
+        data["slowmode_delay"] = channel.slowmode_delay
+    elif ch_type in ("voice", "stage_voice"):
+        data["bitrate"] = channel.bitrate
+        data["user_limit"] = channel.user_limit
+        data["nsfw"] = getattr(channel, "nsfw", False)
+        data["rtc_region"] = str(channel.rtc_region) if channel.rtc_region else None
+        data["video_quality_mode"] = channel.video_quality_mode.name
+    elif ch_type in ("forum", "media"):
+        data["topic"] = channel.topic or ""
+        data["nsfw"] = channel.nsfw
+        data["slowmode_delay"] = channel.slowmode_delay
 
-    # ------------------------------------------------------------------ #
-    # Scheduler
-    # ------------------------------------------------------------------ #
-    @commands.Cog.listener()
-    async def on_ready(self) -> None:
-        if not self.auto_backup_loop.is_running():
-            self.auto_backup_loop.start()
+    return data
 
-    @tasks.loop(minutes=SCHEDULER_TICK_MINUTES)
-    async def auto_backup_loop(self) -> None:
-        for guild in list(self.bot.guilds):
-            try:
-                await self._maybe_auto_backup(guild)
-            except Exception:
-                log.exception("Fallo el backup automático de '%s' (%s)", guild.name, guild.id)
 
-    @auto_backup_loop.before_loop
-    async def _before_auto_backup_loop(self) -> None:
-        await self.bot.wait_until_ready()
+def _channel_sort_key(channel: discord.abc.GuildChannel) -> tuple[bool, int]:
+    # Mismo criterio que ya usa discord.py en CategoryChannel.channels:
+    # canales de texto/foro primero, de voz/stage después, y dentro de
+    # cada grupo por su position real. Se aplica acá también a los
+    # canales SIN categoría (discord.py no expone un equivalente listo
+    # para ese caso), para que el orden capturado sea consistente con
+    # el de dentro de una categoría.
+    is_voice_like = channel.type.name in ("voice", "stage_voice")
+    return (is_voice_like, channel.position)
 
-    async def _maybe_auto_backup(self, guild: discord.Guild) -> None:
-        config = database.get_config(guild.id)
-        interval = config.get("backup_interval_minutes", DEFAULT_INTERVAL_MINUTES)
-        if interval <= 0:
-            return
-        last = config.get("last_auto_backup_at") or 0
-        if time.time() - last < interval * 60:
-            return
-        trigger = "startup" if last == 0 else "periodic"
-        await self._run_backup(guild, trigger=trigger)
 
-    async def _run_backup(self, guild: discord.Guild, trigger: str) -> dict:
-        snapshot = backups.snapshot_guild(guild, trigger)
-        backup_id = backups.save_backup(guild.id, snapshot)
-        config = database.get_config(guild.id)
-        config["last_auto_backup_at"] = time.time()
-        database.save_config(guild.id, config)
-        num_channels = sum(len(c["channels"]) for c in snapshot["categories"]) + len(
-            snapshot["uncategorized"]
-        )
-        log.info(
-            "Backup '%s' (%s) guardado para '%s' (%s): %d categorías, %d canales.",
-            backup_id, trigger, guild.name, guild.id, len(snapshot["categories"]), num_channels,
-        )
-        snapshot["id"] = backup_id
-        return snapshot
-
-    # ------------------------------------------------------------------ #
-    # Comandos
-    # ------------------------------------------------------------------ #
-    @commands.hybrid_group(
-        name="backup",
-        description="Backup automático de categorías y canales del servidor",
-        invoke_without_command=True,
-    )
-    async def backup(self, ctx: commands.Context) -> None:
-        prefix = ctx.prefix if ctx.interaction is None else "/"
-        await ctx.send(
-            embed=info_embed(f"`{prefix}backup now|list|restore|auto`", title="💾 Backup"),
-            ephemeral=True,
-        )
-
-    @backup.command(name="now", description="Guarda un backup manual ahora mismo")
-    @admin_only()
-    async def backup_now(self, ctx: commands.Context) -> None:
-        await ctx.defer(ephemeral=True)
-        snapshot = await self._run_backup(ctx.guild, trigger="manual")
-        num_channels = sum(len(c["channels"]) for c in snapshot["categories"]) + len(
-            snapshot["uncategorized"]
-        )
-        await ctx.send(
-            embed=success_embed(
-                f"Backup `{snapshot['id']}` guardado: **{len(snapshot['categories'])}** "
-                f"categorías y **{num_channels}** canales.",
-            ),
-            ephemeral=True,
-        )
-
-    @backup.command(name="list", description="Muestra los backups guardados de este servidor")
-    async def backup_list(self, ctx: commands.Context) -> None:
-        items = backups.list_backups(ctx.guild.id)
-        if not items:
-            await ctx.send(
-                embed=info_embed(
-                    "Todavía no hay ningún backup. Se toma uno automáticamente apenas el bot "
-                    "está conectado, y podés forzar uno con `/backup now`.",
-                    title="💾 Backups",
-                ),
-                ephemeral=True,
-            )
-            return
-        lines = [
-            f"`{item['id']}` — {_discord_timestamp(item['created_at'])} ({item['trigger']}) — "
-            f"{item['categories']} categorías, {item['channels']} canales"
-            for item in items
-        ]
-        await ctx.send(
-            embed=info_embed("\n".join(lines), title="💾 Backups guardados (más nuevo primero)"),
-            ephemeral=True,
-        )
-
-    @backup.command(name="auto", description="Cada cuánto se guarda un backup automático (0 = desactivar)")
-    @app_commands.describe(minutos="Minutos entre backups automáticos (0 desactiva; mínimo 5 si no es 0)")
-    @admin_only()
-    async def backup_auto(self, ctx: commands.Context, minutos: commands.Range[int, 0, 1440]) -> None:
-        if 0 < minutos < MIN_NONZERO_INTERVAL:
-            await ctx.send(
-                embed=error_embed(f"El mínimo es {MIN_NONZERO_INTERVAL} minutos (o 0 para desactivar)."),
-                ephemeral=True,
-            )
-            return
-        config = database.get_config(ctx.guild.id)
-        config["backup_interval_minutes"] = minutos
-        database.save_config(ctx.guild.id, config)
-        if minutos == 0:
-            msg = "Backups automáticos **desactivados**. `/backup now` sigue disponible a mano."
-        else:
-            msg = f"Backup automático cada **{minutos} minutos**."
-        await ctx.send(embed=success_embed(msg), ephemeral=True)
-
-    @backup.command(name="restore", description="Restaura categorías y canales desde un backup guardado")
-    @app_commands.describe(
-        backup_id="Qué backup restaurar (vacío = el más reciente)",
-        confirmar="Tenés que poner true para que se ejecute de verdad",
-    )
-    @admin_only()
-    async def backup_restore(
-        self, ctx: commands.Context, backup_id: str | None = None, confirmar: bool = False,
-    ) -> None:
-        target_id = backup_id or backups.latest_backup_id(ctx.guild.id)
-        if target_id is None:
-            await ctx.send(embed=error_embed("No hay ningún backup guardado todavía."), ephemeral=True)
-            return
-
-        snapshot = backups.load_backup(ctx.guild.id, target_id)
-        if snapshot is None:
-            await ctx.send(
-                embed=error_embed(f"No encontré ningún backup con id «{target_id}»."), ephemeral=True,
-            )
-            return
-
-        num_channels = sum(len(c["channels"]) for c in snapshot["categories"]) + len(
-            snapshot["uncategorized"]
-        )
-
-        if not confirmar:
-            await ctx.send(
-                embed=info_embed(
-                    f"Esto va a crear (o actualizar, si ya existen con el mismo nombre) "
-                    f"**{len(snapshot['categories'])}** categorías y **{num_channels}** canales, "
-                    f"según el backup de {_discord_timestamp(snapshot['created_at'])}.\n\n"
-                    f"No se borra nada que no esté en el backup. Para confirmar, ejecutá de "
-                    f"nuevo con `confirmar: true`.",
-                    title="⚠️ Confirmar restauración",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        lock = self._lock_for(ctx.guild.id)
-        if lock.locked():
-            await ctx.send(
-                embed=error_embed("Ya hay una restauración en curso en este servidor — esperá a que termine."),
-                ephemeral=True,
-            )
-            return
-
-        await ctx.defer(ephemeral=True)
-        async with lock:
-            report = await self._restore(ctx.guild, snapshot)
-
-        summary = f"**{report.created}** canales/categorías creados, **{report.updated}** actualizados."
-        if report.errors:
-            shown = report.errors[:10]
-            summary += "\n\n⚠️ Problemas:\n" + "\n".join(f"• {e}" for e in shown)
-            extra = len(report.errors) - len(shown)
-            if extra > 0:
-                summary += f"\n• …y {extra} más."
-        await ctx.send(embed=success_embed(summary, title="💾 Restauración completa"), ephemeral=True)
-
-        config = database.get_config(ctx.guild.id)
-        log_channel = ctx.guild.get_channel(config.get("log_channel")) if config.get("log_channel") else None
-        if log_channel is not None:
-            embed = discord.Embed(
-                title="💾 Backup restaurado",
-                description=(
-                    f"{ctx.author.mention} restauró el backup `{target_id}` "
-                    f"({report.created} creados, {report.updated} actualizados)."
-                ),
-                color=COLOR_INFO,
-                timestamp=discord.utils.utcnow(),
-            )
-            try:
-                await log_channel.send(embed=embed)
-            except discord.HTTPException:
-                pass
-
-    @backup_restore.autocomplete("backup_id")
-    async def _backup_id_autocomplete(
-        self, interaction: discord.Interaction, current: str,
-    ) -> list[app_commands.Choice[str]]:
-        if interaction.guild_id is None:
-            return []
-        choices = []
-        for item in backups.list_backups(interaction.guild_id):
-            label = (
-                f"{item['id']} — {_relative_label(item['created_at'])} "
-                f"({item['trigger']}, {item['categories']} cat / {item['channels']} canales)"
-            )
-            if current.lower() in label.lower():
-                choices.append(app_commands.Choice(name=label[:100], value=item["id"]))
-        return choices[:25]
-
-    # ------------------------------------------------------------------ #
-    # Motor de restauración
-    # ------------------------------------------------------------------ #
-    async def _restore(self, guild: discord.Guild, snapshot: dict) -> RestoreReport:
-        report = RestoreReport()
-        role_by_id = {r.id: r for r in guild.roles}
-        role_by_name = {r.name.lower(): r for r in guild.roles}
-
-        def resolve_overwrites(entries: list[dict]) -> dict:
-            result = {}
-            for entry in entries:
-                allow = discord.Permissions(entry["allow"])
-                deny = discord.Permissions(entry["deny"])
-                ow = discord.PermissionOverwrite.from_pair(allow, deny)
-                if entry["type"] == "role":
-                    target = role_by_id.get(entry["id"]) or role_by_name.get(
-                        entry["name"].lstrip("@").lower()
-                    )
-                else:
-                    target = guild.get_member(entry["id"])
-                if target is not None:
-                    result[target] = ow
-            return result
-
-        # 1) Categorías: reusar por id o nombre, o crear.
-        existing_cat_by_id = {c.id: c for c in guild.categories}
-        existing_cat_by_name = {c.name.lower(): c for c in guild.categories}
-        category_objs: list[discord.CategoryChannel | None] = []
-
-        for cat_data in snapshot["categories"]:
-            existing = existing_cat_by_id.get(cat_data["id"]) or existing_cat_by_name.get(
-                cat_data["name"].lower()
-            )
-            overwrites = resolve_overwrites(cat_data.get("overwrites", []))
-            if existing is not None:
-                # La categoría YA existe de verdad — aunque falle el
-                # rename/overwrites, sigue siendo un lugar válido donde
-                # poner sus canales, así que NO se trata como fallo total.
-                try:
-                    await existing.edit(name=cat_data["name"], overwrites=overwrites, reason=RESTORE_REASON)
-                    report.updated += 1
-                except discord.HTTPException as exc:
-                    report.errors.append(f"No se pudo actualizar la categoría «{cat_data['name']}»: {exc}")
-                category_objs.append(existing)
-            else:
-                try:
-                    new_cat = await guild.create_category(
-                        cat_data["name"], overwrites=overwrites, reason=RESTORE_REASON,
-                    )
-                    report.created += 1
-                    category_objs.append(new_cat)
-                    existing_cat_by_name[cat_data["name"].lower()] = new_cat
-                except discord.Forbidden:
-                    report.errors.append(f"Sin permiso para crear la categoría «{cat_data['name']}»")
-                    category_objs.append(None)
-                except discord.HTTPException as exc:
-                    report.errors.append(f"No se pudo crear la categoría «{cat_data['name']}»: {exc}")
-                    category_objs.append(None)
-            await asyncio.sleep(SLEEP_BETWEEN_CALLS)
-
-        # 2) Orden de categorías (de arriba hacia abajo, edits secuenciales).
-        for idx, cat in enumerate(category_objs):
-            if cat is None:
-                continue
-            try:
-                await cat.edit(position=idx, reason=f"{RESTORE_REASON} (orden)")
-            except discord.HTTPException:
-                pass
-            await asyncio.sleep(SLEEP_BETWEEN_CALLS)
-
-        # 3) Canales. El lookup por id es GLOBAL (no solo dentro de la
-        # categoría "correcta") para poder encontrar y reubicar un canal
-        # que sigue existiendo pero quedó en otro lado.
-        all_channels_by_id = {
-            c.id: c for c in guild.channels if not isinstance(c, discord.CategoryChannel)
+def type_specific_kwargs(ch_type: str, data: dict[str, Any]) -> dict[str, Any]:
+    """Arma los kwargs de discord.py específicos de cada tipo de canal a
+    partir de los datos guardados, para pasarlos tanto a create_* como a
+    .edit(). Vive acá (no en cogs/backups.py) porque es lógica pura de
+    mapeo de datos, sin llamadas a la API."""
+    if ch_type in ("text", "news"):
+        return {
+            "topic": data.get("topic") or "",
+            "nsfw": data.get("nsfw", False),
+            "slowmode_delay": data.get("slowmode_delay", 0),
         }
+    if ch_type in ("voice", "stage_voice"):
+        vqm_name = data.get("video_quality_mode") or "auto"
+        vqm = getattr(discord.VideoQualityMode, vqm_name, discord.VideoQualityMode.auto)
+        return {
+            "bitrate": data.get("bitrate") or 64000,
+            "user_limit": data.get("user_limit", 0),
+            "nsfw": data.get("nsfw", False),
+            "rtc_region": data.get("rtc_region"),
+            "video_quality_mode": vqm,
+        }
+    if ch_type in ("forum", "media"):
+        return {
+            "topic": data.get("topic") or "",
+            "nsfw": data.get("nsfw", False),
+            "slowmode_delay": data.get("slowmode_delay", 0),
+        }
+    return {}
 
-        for cat_data, category in zip(snapshot["categories"], category_objs):
-            if category is None:
-                # La categoría no se pudo crear — sus canales se omiten
-                # a propósito en vez de crearlos sueltos sin categoría,
-                # que sería más confuso que simplemente no crearlos.
-                if cat_data["channels"]:
-                    report.errors.append(
-                        f"Se omitieron {len(cat_data['channels'])} canal(es) de "
-                        f"«{cat_data['name']}» porque la categoría no se pudo crear."
-                    )
-                continue
-            await self._restore_channel_list(
-                guild, cat_data["channels"], category, all_channels_by_id, resolve_overwrites, report,
-            )
 
-        # 4) Canales sin categoría.
-        await self._restore_channel_list(
-            guild, snapshot["uncategorized"], None, all_channels_by_id, resolve_overwrites, report,
-        )
+def snapshot_guild(guild: discord.Guild, trigger: str) -> dict[str, Any]:
+    """Arma el snapshot del estado actual de categorías y canales, en el
+    mismo orden en que Discord los muestra (de arriba hacia abajo)."""
+    categories_data = []
+    for category in sorted(guild.categories, key=lambda c: c.position):
+        channels_data = [
+            d for c in category.channels if (d := _channel_to_data(c)) is not None
+        ]
+        categories_data.append({
+            "id": category.id,
+            "name": category.name,
+            "overwrites": _overwrites_to_data(category.overwrites),
+            "channels": channels_data,
+        })
 
-        return report
+    uncategorized = [
+        c for c in guild.channels
+        if not isinstance(c, discord.CategoryChannel)
+        and c.category is None
+        and c.type.name in SUPPORTED_CHANNEL_TYPES
+    ]
+    uncategorized.sort(key=_channel_sort_key)
+    uncategorized_data = [_channel_to_data(c) for c in uncategorized]
 
-    async def _restore_channel_list(
-        self,
-        guild: discord.Guild,
-        channel_entries: list[dict],
-        category: discord.CategoryChannel | None,
-        all_channels_by_id: dict[int, discord.abc.GuildChannel],
-        resolve_overwrites,
-        report: RestoreReport,
-    ) -> None:
-        if category is not None:
-            siblings = category.channels
-        else:
-            siblings = [
-                c for c in guild.channels
-                if not isinstance(c, discord.CategoryChannel) and c.category is None
-            ]
-        existing_by_name = {(c.name.lower(), c.type.name): c for c in siblings}
+    return {
+        "version": SCHEMA_VERSION,
+        "guild_id": guild.id,
+        "guild_name": guild.name,
+        "created_at": discord.utils.utcnow().isoformat(),
+        "trigger": trigger,
+        "categories": categories_data,
+        "uncategorized": uncategorized_data,
+    }
 
-        channel_objs: list[discord.abc.GuildChannel | None] = []
-        for ch_data in channel_entries:
-            existing = all_channels_by_id.get(ch_data["id"])
-            if existing is not None and existing.type.name != ch_data["type"]:
-                existing = None
-            if existing is None:
-                existing = existing_by_name.get((ch_data["name"].lower(), ch_data["type"]))
 
-            overwrites = resolve_overwrites(ch_data.get("overwrites", []))
+def save_backup(guild_id: int, snapshot: dict[str, Any]) -> str:
+    """Guarda el snapshot como un archivo nuevo (no pisa los anteriores)
+    y poda los más viejos. Devuelve el backup_id (timestamp unix)."""
+    backup_id = str(int(time.time()))
+    path = _guild_dir(guild_id) / f"{backup_id}.json"
+    with _lock:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2, ensure_ascii=False)
+        _prune(guild_id)
+    return backup_id
+
+
+def _prune(guild_id: int) -> None:
+    files = sorted(_guild_dir(guild_id).glob("*.json"), key=lambda p: p.stem, reverse=True)
+    for old in files[MAX_BACKUPS_PER_GUILD:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def list_backups(guild_id: int) -> list[dict[str, Any]]:
+    """Metadata de los backups guardados, más nuevo primero.
+
+    Cada archivo se procesa de forma aislada: si uno solo está corrupto,
+    incompleto (crash a mitad de escritura) o tiene un schema viejo al
+    que le falta alguna clave, se lo salta en vez de tirar abajo el
+    comando entero (antes un solo backup con datos mal formados hacía
+    fallar TODO /backup list con un error genérico).
+    """
+    results = []
+    with _lock:
+        paths = sorted(_guild_dir(guild_id).glob("*.json"), key=lambda p: p.stem, reverse=True)
+        for path in paths:
             try:
-                obj = await self._create_or_update_channel(guild, category, ch_data, existing, overwrites)
-                channel_objs.append(obj)
-                if existing is not None:
-                    report.updated += 1
-                else:
-                    report.created += 1
-                    all_channels_by_id[obj.id] = obj
-            except discord.Forbidden:
-                report.errors.append(f"Sin permiso para «{ch_data['name']}»")
-                channel_objs.append(None)
-            except discord.HTTPException as exc:
-                report.errors.append(f"Canal «{ch_data['name']}»: {exc}")
-                channel_objs.append(None)
-            await asyncio.sleep(SLEEP_BETWEEN_CALLS)
-
-        for idx, obj in enumerate(channel_objs):
-            if obj is None:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                num_categories = len(data.get("categories", []))
+                num_channels = sum(
+                    len(c.get("channels", [])) for c in data.get("categories", [])
+                ) + len(data.get("uncategorized", []))
+                results.append({
+                    "id": path.stem,
+                    "created_at": data.get("created_at"),
+                    "trigger": data.get("trigger", "?"),
+                    "categories": num_categories,
+                    "channels": num_channels,
+                })
+            except (OSError, json.JSONDecodeError, KeyError, TypeError, AttributeError):
                 continue
+    return results
+
+
+def load_backup(guild_id: int, backup_id: str) -> dict[str, Any] | None:
+    # backup_id llega de un usuario (comando/autocomplete): nunca se
+    # concatena directo a una ruta sin validar el formato, para no
+    # abrir la puerta a path traversal (ej. "../../algo").
+    if not backup_id.isdigit():
+        return None
+    path = _guild_dir(guild_id) / f"{backup_id}.json"
+    if not path.exists():
+        return None
+    with _lock:
+        with open(path, "r", encoding="utf-8") as f:
             try:
-                await obj.edit(position=idx, reason=f"{RESTORE_REASON} (orden)")
-            except discord.HTTPException:
-                pass
-            await asyncio.sleep(SLEEP_BETWEEN_CALLS)
-
-    async def _create_or_update_channel(
-        self,
-        guild: discord.Guild,
-        category: discord.CategoryChannel | None,
-        data: dict,
-        existing: discord.abc.GuildChannel | None,
-        overwrites: dict,
-    ) -> discord.abc.GuildChannel:
-        ch_type = data["type"]
-        extra = backups.type_specific_kwargs(ch_type, data)
-
-        if existing is not None:
-            await existing.edit(
-                name=data["name"], category=category, overwrites=overwrites,
-                reason=RESTORE_REASON, **extra,
-            )
-            return existing
-
-        if ch_type in ("text", "news"):
-            return await guild.create_text_channel(
-                data["name"], category=category, overwrites=overwrites,
-                news=(ch_type == "news"), reason=RESTORE_REASON, **extra,
-            )
-        if ch_type == "voice":
-            return await guild.create_voice_channel(
-                data["name"], category=category, overwrites=overwrites, reason=RESTORE_REASON, **extra,
-            )
-        if ch_type == "stage_voice":
-            return await guild.create_stage_channel(
-                data["name"], category=category, overwrites=overwrites, reason=RESTORE_REASON, **extra,
-            )
-        if ch_type in ("forum", "media"):
-            return await guild.create_forum(
-                data["name"], category=category, overwrites=overwrites,
-                media=(ch_type == "media"), reason=RESTORE_REASON, **extra,
-            )
-        raise ValueError(f"Tipo de canal no soportado: {ch_type}")
+                return json.load(f)
+            except json.JSONDecodeError:
+                return None
 
 
-async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(BackupCommands(bot))
+def latest_backup_id(guild_id: int) -> str | None:
+    files = sorted(_guild_dir(guild_id).glob("*.json"), key=lambda p: p.stem, reverse=True)
+    return files[0].stem if files else None
